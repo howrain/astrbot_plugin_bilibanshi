@@ -30,7 +30,7 @@
 可在 AstrBot 插件设置页中配置：
 
 - `auto_start`：开机自启动
-- `scan_interval`：扫描间隔（秒）
+- `cron_expression`：五段式定时 Cron 表达式，默认 `0 * * * *`（每小时整点）
 - `max_duration`：最大视频时长（秒）
 - `max_pages`：搜索页数
 - `bilibili_cookie`：可选的 B 站 Cookie 请求头，支持粘贴 Cookie 值或带 `Cookie:` 前缀的完整请求头；WebUI 中会遮罩显示
@@ -43,8 +43,10 @@
 - `use_whitelist_mode`：是否启用白名单模式（**默认开启**，防止新装插件后自动群发）
 - `whitelist_groups`：白名单群号列表
 - `blacklist_groups`：黑名单群号列表
-- `quiet_hours_start`：免打扰开始时间
-- `quiet_hours_end`：免打扰结束时间
+- `quiet_hours_start`：免打扰开始时间（默认 `23:00`）
+- `quiet_hours_end`：免打扰结束时间（默认 `07:00`）
+
+Cron 按运行 AstrBot 主机的本地时区计算，格式为“分 时 日 月 周”，支持数字、`*`、逗号列表、范围和步长，例如 `0 */2 * * *` 表示每两小时整点执行。定时任务只在 Cron 命中的分钟触发；命中 23:00–次日 07:00 的免打扰时段时会跳过。把免打扰开始和结束时间设为相同值可关闭宵禁。
 
 ### 视频来源筛选
 
@@ -96,7 +98,7 @@ UP 主模式仍受 `max_duration` 和 `max_pages` 限制；已处理视频按 BV
 
 ### 配置管理
 
-- `/bilibanshi interval <秒>`：设置搬石间隔
+- `/bilibanshi cron <分 时 日 月 周>`：设置定时 Cron，例如 `/bilibanshi cron 0 * * * *`
 - `/bilibanshi maxduration <秒>`：设置最大视频时长
 - `/bilibanshi mode <whitelist|blacklist>`：切换群推送模式
 

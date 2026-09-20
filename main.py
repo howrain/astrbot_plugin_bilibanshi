@@ -33,6 +33,7 @@ class BilibiliPolluterPlugin(Star):
     # /bilibanshi now 防刷屏参数
     MANUAL_NOW_WINDOW_SECONDS = 60
     MANUAL_NOW_COOLDOWN_SECONDS = 60
+    SCHEDULE_FAILURE_COOLDOWN_SECONDS = 600
     # 标题记录有上限；BVID 历史完整保留，确保 UP 投稿不会因裁剪而重播
     MAX_SENT_TITLES = 5000
 
@@ -149,6 +150,7 @@ class BilibiliPolluterPlugin(Star):
 
     async def initialize(self):
         """插件初始化 - 创建会话、迁移旧配置、启动定时任务"""
+        self._ensure_schedule_defaults()
         timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=20)
         self.session = aiohttp.ClientSession(headers=self.headers, timeout=timeout)
         self.client = BilibiliClient(self.session, self.semaphore)
@@ -905,6 +907,105 @@ class BilibiliPolluterPlugin(Star):
 
     # ==================== 定时任务 ====================
 
+    def _ensure_schedule_defaults(self) -> None:
+        """为旧配置补齐 Cron 与默认宵禁，避免升级后仍按旧空值运行。"""
+        defaults = {
+            "cron_expression": "0 * * * *",
+            "quiet_hours_start": "23:00",
+            "quiet_hours_end": "07:00",
+        }
+        changed = False
+        for key, default in defaults.items():
+            if not str(self.config.get(key, "") or "").strip():
+                self.config[key] = default
+                changed = True
+        if changed:
+            self.config.save_config()
+
+    @staticmethod
+    def _parse_cron_field(field: str, minimum: int, maximum: int) -> set[int]:
+        """解析 Cron 单字段，支持 *、列表、范围和步长。"""
+        values = set()
+        for part in field.split(","):
+            if not part:
+                raise ValueError("字段中存在空列表项")
+
+            if part.count("/") > 1:
+                raise ValueError("步长格式无效")
+            if "/" in part:
+                base, step_text = part.split("/", 1)
+                try:
+                    step = int(step_text)
+                except ValueError as exc:
+                    raise ValueError("步长必须是正整数") from exc
+                if step <= 0:
+                    raise ValueError("步长必须是正整数")
+            else:
+                base = part
+                step = 1
+
+            if base == "*":
+                start, end = minimum, maximum
+            elif "-" in base:
+                if base.count("-") != 1:
+                    raise ValueError("范围格式无效")
+                start_text, end_text = base.split("-", 1)
+                try:
+                    start, end = int(start_text), int(end_text)
+                except ValueError as exc:
+                    raise ValueError("范围必须使用数字") from exc
+            else:
+                try:
+                    start = int(base)
+                except ValueError as exc:
+                    raise ValueError("字段值必须使用数字、范围或 *") from exc
+                end = maximum if "/" in part else start
+
+            if start < minimum or end > maximum or start > end:
+                raise ValueError(f"字段取值范围应为 {minimum}-{maximum}")
+            values.update(range(start, end + 1, step))
+
+        if not values:
+            raise ValueError("字段没有有效取值")
+        return values
+
+    @classmethod
+    def _parse_cron_expression(cls, expression: str) -> tuple[list[set[int]], list[str]]:
+        """解析五段式 Cron；星期使用 0/7 表示周日，1 表示周一。"""
+        fields = str(expression or "").split()
+        if len(fields) != 5:
+            raise ValueError("需要五段：分 时 日 月 周")
+
+        ranges = ((0, 59), (0, 23), (1, 31), (1, 12), (0, 7))
+        parsed = [
+            cls._parse_cron_field(field, minimum, maximum)
+            for field, (minimum, maximum) in zip(fields, ranges)
+        ]
+        parsed[4] = {0 if day == 7 else day for day in parsed[4]}
+        return parsed, fields
+
+    @classmethod
+    def _cron_matches(cls, expression: str, when: datetime) -> bool:
+        """判断本地时间是否匹配五段式 Cron。"""
+        values, fields = cls._parse_cron_expression(expression)
+        minute, hour, day_of_month, month, day_of_week = values
+
+        if when.minute not in minute or when.hour not in hour or when.month not in month:
+            return False
+
+        dom_matches = when.day in day_of_month
+        cron_weekday = (when.weekday() + 1) % 7
+        dow_matches = cron_weekday in day_of_week
+        dom_is_wildcard = fields[2] == "*"
+        dow_is_wildcard = fields[4] == "*"
+        if dom_is_wildcard and dow_is_wildcard:
+            return True
+        if dom_is_wildcard:
+            return dow_matches
+        if dow_is_wildcard:
+            return dom_matches
+        return dom_matches or dow_matches
+
     @staticmethod
     def _normalize_hhmm(value: Any) -> str:
         """规范化 HH:MM 时间，兼容 "9:00" 等非零填充格式。"""
@@ -913,15 +1014,19 @@ class BilibiliPolluterPlugin(Star):
         parts = str(value).strip().split(":")
         if len(parts) == 2 and all(p.strip().isdigit() for p in parts):
             try:
-                return f"{int(parts[0]):02d}:{int(parts[1]):02d}"
+                hour, minute = int(parts[0]), int(parts[1])
+                if 0 <= hour <= 23 and 0 <= minute <= 59:
+                    return f"{hour:02d}:{minute:02d}"
             except ValueError:
-                return ""
+                pass
         return ""
 
     def _is_quiet_hours(self) -> bool:
         """检查当前是否在免打扰时段内（支持跨午夜）"""
-        quiet_start = self._normalize_hhmm(self.config.get("quiet_hours_start", ""))
-        quiet_end = self._normalize_hhmm(self.config.get("quiet_hours_end", ""))
+        quiet_start = self._normalize_hhmm(
+            self.config.get("quiet_hours_start", "23:00")
+        )
+        quiet_end = self._normalize_hhmm(self.config.get("quiet_hours_end", "07:00"))
 
         if not quiet_start or not quiet_end:
             return False
@@ -934,31 +1039,55 @@ class BilibiliPolluterPlugin(Star):
         return now >= quiet_start or now < quiet_end
 
     async def _timer_task(self):
-        """定时任务（带异常恢复）"""
+        """按本地时间的 Cron 分钟触发定时任务。"""
+        last_checked_minute = None
+        last_invalid_expression = None
+        retry_not_before = 0.0
+        loop = asyncio.get_running_loop()
+
         while self.running:
             try:
-                # 检查免打扰时段
-                if self._is_quiet_hours():
-                    logger.debug("当前在免打扰时段，跳过本次推送")
-                    await asyncio.sleep(self.config.get("scan_interval", 60))
-                    continue
+                now = datetime.now()
+                scheduled_minute = now.replace(second=0, microsecond=0)
+                if scheduled_minute != last_checked_minute:
+                    last_checked_minute = scheduled_minute
+                    expression = str(
+                        self.config.get("cron_expression", "0 * * * *")
+                    ).strip()
+                    try:
+                        due = self._cron_matches(expression, scheduled_minute)
+                    except ValueError as e:
+                        due = False
+                        if expression != last_invalid_expression:
+                            logger.error(f"定时任务 Cron 表达式无效，已暂停触发: {e}")
+                        last_invalid_expression = expression
+                    else:
+                        last_invalid_expression = None
 
-                # 执行扫描和下载
-                await self._scan_and_download()
+                    if due and self._is_quiet_hours():
+                        logger.debug("当前在免打扰时段，跳过本次定时推送")
+                    elif due and loop.time() < retry_not_before:
+                        logger.debug("定时任务仍在失败冷却期，跳过本次触发")
+                    elif due:
+                        await self._scan_and_download()
+                        if self._last_scan_failed:
+                            retry_not_before = (
+                                loop.time() + self.SCHEDULE_FAILURE_COOLDOWN_SECONDS
+                            )
+                        else:
+                            retry_not_before = 0.0
 
-                # 请求、下载或发送失败后统一退避，避免持续请求加重风控或平台限流。
-                if self._last_scan_failed:
-                    await asyncio.sleep(max(self.config.get("scan_interval", 60), 600))
-                else:
-                    await asyncio.sleep(self.config.get("scan_interval", 60))
+                # Cron 精度为分钟；对齐到下一分钟边界，避免固定间隔逐渐漂移。
+                now = datetime.now()
+                seconds_to_next_minute = 60 - now.second - now.microsecond / 1_000_000
+                await asyncio.sleep(max(0.1, seconds_to_next_minute))
 
             except asyncio.CancelledError:
                 logger.info("定时任务被取消")
                 break
             except Exception as e:
                 logger.error(f"定时任务异常: {e}")
-                # 发生异常时等待较长时间再重试，避免频繁失败
-                await asyncio.sleep(60)
+                await asyncio.sleep(1)
 
     # ==================== 指令区 ====================
 
@@ -1153,7 +1282,7 @@ class BilibiliPolluterPlugin(Star):
         status = [
             "=== B站搬石状态 ===",
             f"运行状态: {'✅ 运行中' if self.running else '❌ 已停止'}",
-            f"扫描间隔: {self.config.get('scan_interval', 60)}秒",
+            f"定时 Cron: {self.config.get('cron_expression', '0 * * * *')}",
             f"最大时长: {max_duration}秒 ({max_duration // 60}分钟)",
             f"已记录标题: {len(self.sent_titles)} 个"
             + (f"（其中失败 {failed_count} 个）" if failed_count else ""),
@@ -1291,26 +1420,25 @@ class BilibiliPolluterPlugin(Star):
         else:
             yield event.plain_result("未知操作，请使用 add 或 remove")
 
-    @filter.command("bilibanshi interval")
+    @filter.command("bilibanshi cron")
     @filter.permission_type(filter.PermissionType.ADMIN)
-    async def set_interval(self, event: AstrMessageEvent):
-        """设置扫描间隔(秒): /bilibanshi interval 60"""
-        parts = event.message_str.strip().split()
+    async def set_cron(self, event: AstrMessageEvent):
+        """设置五段式 Cron: /bilibanshi cron 0 * * * *"""
+        parts = event.message_str.strip().split(maxsplit=2)
         if len(parts) < 3:
-            yield event.plain_result("用法: /bilibanshi interval <秒数>")
+            yield event.plain_result("用法: /bilibanshi cron <分 时 日 月 周>")
             return
 
+        expression = parts[2].strip()
         try:
-            interval = int(parts[2])
-            if interval < 10:
-                yield event.plain_result("间隔不能小于10秒")
-                return
+            self._parse_cron_expression(expression)
+        except ValueError as e:
+            yield event.plain_result(f"Cron表达式无效: {e}")
+            return
 
-            self.config["scan_interval"] = interval
-            self.config.save_config()
-            yield event.plain_result(f"已设置扫描间隔: {interval}秒")
-        except ValueError:
-            yield event.plain_result("请输入有效的数字")
+        self.config["cron_expression"] = expression
+        self.config.save_config()
+        yield event.plain_result(f"已设置定时 Cron: {expression}")
 
     @filter.command("bilibanshi maxduration")
     @filter.permission_type(filter.PermissionType.ADMIN)
