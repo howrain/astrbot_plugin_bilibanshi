@@ -95,7 +95,7 @@ def parse_duration(duration_text: Any) -> int:
 
 
 class BilibiliClient:
-    """封装 B站搜索与播放地址 API。
+    """封装 B站搜索、用户投稿列表与播放地址 API。
 
     Args:
         session: 共享的 aiohttp.ClientSession。
@@ -264,6 +264,86 @@ class BilibiliClient:
             logger.error(f"回退搜索第{page}页出错: {e}")
             return None
 
+    async def search_user_videos(
+        self, mid: str, page: int = 1, page_size: int = 30
+    ) -> List[Dict[str, Any]]:
+        """获取指定 UP 主按投稿时间排序的一页视频。"""
+        keys = await self._get_wbi_keys()
+        if not keys:
+            logger.warning(f"获取 UP 主 {mid} 投稿失败：WBI 密钥不可用")
+            return []
+
+        try:
+            params = enc_wbi(
+                {
+                    "mid": mid,
+                    "pn": page,
+                    "ps": page_size,
+                    "order": "pubdate",
+                    "tid": 0,
+                },
+                keys[0],
+                keys[1],
+            )
+            api_url = "https://api.bilibili.com/x/space/wbi/arc/search?" + urlencode(params)
+            async with self.semaphore:
+                async with self.session.get(api_url) as response:
+                    if response.status != 200:
+                        logger.warning(
+                            f"获取 UP 主 {mid} 投稿失败: HTTP {response.status}"
+                        )
+                        return []
+                    data = await response.json()
+
+            if data.get("code") != 0:
+                logger.warning(
+                    f"获取 UP 主 {mid} 投稿失败: "
+                    f"code={data.get('code')}, message={data.get('message', '未知错误')}"
+                )
+                return []
+
+            vlist = (
+                (data.get("data") or {}).get("list") or {}
+            ).get("vlist") or []
+            return self._normalize_user_video_items(vlist, mid)
+        except asyncio.TimeoutError:
+            logger.warning(f"获取 UP 主 {mid} 投稿第{page}页超时")
+            return []
+        except Exception as e:
+            logger.error(f"获取 UP 主 {mid} 投稿第{page}页出错: {e}")
+            return []
+
+    @staticmethod
+    def _normalize_user_video_items(
+        raw_items: List[Dict[str, Any]], mid: str
+    ) -> List[Dict[str, Any]]:
+        """将 UP 主投稿列表条目统一为下载流程使用的结构。"""
+        items = []
+        for video in raw_items:
+            try:
+                title = clean_html_title(video.get("title", ""))
+                bvid = str(video.get("bvid", "")).strip()
+                if not title or not bvid:
+                    continue
+
+                duration_text = video.get("length") or video.get("duration", "")
+                items.append(
+                    {
+                        "title": title,
+                        "bvid": bvid,
+                        "url": f"https://www.bilibili.com/video/{bvid}",
+                        "play": video.get("play", 0),
+                        "duration": duration_text,
+                        "duration_seconds": parse_duration(duration_text),
+                        "author": video.get("author", ""),
+                        "uploader_mid": str(video.get("mid") or mid),
+                        "search_keyword": "",
+                    }
+                )
+            except Exception as e:
+                logger.error(f"解析 UP 主 {mid} 投稿信息失败: {e}")
+        return items
+
     @staticmethod
     def _normalize_search_items(
         raw_items: List[Dict[str, Any]], keyword: str
@@ -286,6 +366,7 @@ class BilibiliClient:
                         "duration": duration_text,
                         "duration_seconds": parse_duration(duration_text),
                         "author": video.get("author", ""),
+                        "uploader_mid": str(video.get("mid") or video.get("up_mid") or ""),
                         "search_keyword": keyword,
                     }
                 )

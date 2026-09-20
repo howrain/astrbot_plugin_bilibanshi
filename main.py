@@ -33,7 +33,7 @@ class BilibiliPolluterPlugin(Star):
     # /bilibanshi now 防刷屏参数
     MANUAL_NOW_WINDOW_SECONDS = 60
     MANUAL_NOW_COOLDOWN_SECONDS = 60
-    # 已发送标题记录上限，避免 runtime_state.json 无限膨胀
+    # 标题记录有上限；BVID 历史完整保留，确保 UP 投稿不会因裁剪而重播
     MAX_SENT_TITLES = 5000
 
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -60,6 +60,9 @@ class BilibiliPolluterPlugin(Star):
         runtime_state = self.store.load("runtime_state", {}) or {}
         self.sent_titles: Dict[str, Dict[str, str]] = self._restore_sent_titles(
             runtime_state.get("sent_titles", {})
+        )
+        self.sent_video_ids: Dict[str, str] = self._restore_sent_video_ids(
+            runtime_state.get("sent_video_ids", {}), self.sent_titles
         )
         self.last_manual_trigger_ts = float(runtime_state.get("last_manual_trigger_ts", 0) or 0)
         self.manual_cooldown_until_ts = float(runtime_state.get("manual_cooldown_until_ts", 0) or 0)
@@ -239,9 +242,33 @@ class BilibiliPolluterPlugin(Star):
                     "title": title,
                     "sent_at": str(item.get("sent_at", "")).strip(),
                     "failed": item.get("failed") is True,
+                    "bvid": str(item.get("bvid", "")).strip(),
                 }
         self._prune_sent_titles(sent_titles)
         return sent_titles
+
+    def _restore_sent_video_ids(
+        self, raw: Any, sent_titles: Dict[str, Dict[str, str]]
+    ) -> Dict[str, str]:
+        """恢复 BVID 去重记录，并从较新格式的标题记录补齐 ID。"""
+        video_ids: Dict[str, str] = {}
+        if isinstance(raw, dict):
+            for bvid, sent_at in raw.items():
+                normalized_bvid = str(bvid).strip()
+                if normalized_bvid:
+                    video_ids[normalized_bvid] = str(sent_at or "")
+        elif isinstance(raw, list):
+            for bvid in raw:
+                normalized_bvid = str(bvid).strip()
+                if normalized_bvid:
+                    video_ids[normalized_bvid] = ""
+
+        for item in sent_titles.values():
+            bvid = str(item.get("bvid", "")).strip()
+            if bvid and bvid not in video_ids:
+                video_ids[bvid] = str(item.get("sent_at", ""))
+
+        return video_ids
 
     def _prune_sent_titles(self, sent_titles: Optional[Dict[str, Dict[str, str]]] = None) -> None:
         """删除最旧的记录，保持上限。"""
@@ -256,30 +283,51 @@ class BilibiliPolluterPlugin(Star):
             return False
         return normalized_title in self.sent_titles
 
+    def _has_sent_video(self, video: Dict[str, Any]) -> bool:
+        """优先按 BVID 去重；旧版只有标题的记录继续作为兼容兜底。"""
+        bvid = str(video.get("bvid", "")).strip()
+        if bvid and bvid in self.sent_video_ids:
+            return True
+
+        normalized_title = self._normalize_title(video.get("title", ""))
+        legacy_record = self.sent_titles.get(normalized_title)
+        return bool(legacy_record and not legacy_record.get("bvid"))
+
     def _runtime_state_dict(self) -> Dict[str, Any]:
         return {
             "sent_titles": self.sent_titles,
+            "sent_video_ids": self.sent_video_ids,
             "last_manual_trigger_ts": self.last_manual_trigger_ts,
             "manual_cooldown_until_ts": self.manual_cooldown_until_ts,
         }
 
-    async def _record_sent_title(self, title: str, failed: bool = False) -> None:
-        """记录已处理标题（failed=True 表示发送/下载失败，避免死循环重试）"""
+    async def _record_sent_title(
+        self, title: str, failed: bool = False, bvid: Optional[str] = None
+    ) -> None:
+        """记录已处理标题和 BVID，避免重复搬运或失败后持续重试。"""
         normalized_title = self._normalize_title(title)
-        if not normalized_title:
+        normalized_bvid = str(bvid or "").strip()
+        if not normalized_title and not normalized_bvid:
             return
 
-        self.sent_titles[normalized_title] = {
-            "title": str(title).strip(),
-            "sent_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "failed": failed,
-        }
-        self._prune_sent_titles()
+        sent_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if normalized_title:
+            item = {
+                "title": str(title).strip(),
+                "sent_at": sent_at,
+                "failed": failed,
+                "bvid": normalized_bvid,
+            }
+            self.sent_titles[normalized_title] = item
+            self._prune_sent_titles()
+        if normalized_bvid:
+            self.sent_video_ids[normalized_bvid] = sent_at
+
         await self.store.save("runtime_state", self._runtime_state_dict())
         if failed:
-            logger.info(f"已记录失败标题(后续跳过): {title}")
+            logger.info(f"已记录失败视频(后续跳过): {title or normalized_bvid}")
         else:
-            logger.info(f"已记录发送标题: {title}")
+            logger.info(f"已记录发送视频: {title or normalized_bvid}")
 
     # ==================== 手动触发冷却 ====================
 
@@ -319,13 +367,67 @@ class BilibiliPolluterPlugin(Star):
 
     # ==================== 搜索部分 ====================
 
+    def _selection_mode(self) -> str:
+        """读取来源筛选模式；未知值安全回退到原有关键词模式。"""
+        configured_mode = str(self.config.get("selection_mode", "关键词")).strip().lower()
+        mode_aliases = {
+            "keyword": "keyword",
+            "关键词": "keyword",
+            "up_uid": "up_uid",
+            "up主uid": "up_uid",
+            "up主 uid": "up_uid",
+            "uid": "up_uid",
+            "random": "random",
+            "两者随机": "random",
+        }
+        mode = mode_aliases.get(configured_mode)
+        if mode:
+            return mode
+        logger.warning(f"未知筛选方式 {configured_mode!r}，按关键词模式处理")
+        return "keyword"
+
+    def _configured_keywords(self) -> List[str]:
+        raw_keywords = self.config.get("search_keywords", [])
+        if not isinstance(raw_keywords, list):
+            return []
+        return [str(keyword).strip() for keyword in raw_keywords if str(keyword).strip()]
+
+    def _configured_up_mids(self) -> List[str]:
+        """解析 UP 主配置项：纯 UID 或 ``UID:备注``。"""
+        raw_up_mids = self.config.get("up_mids", [])
+        if not isinstance(raw_up_mids, list):
+            return []
+
+        up_mids: List[str] = []
+        seen_mids = set()
+        for item in raw_up_mids:
+            value = str(item).strip()
+            uid_value = value.partition(":")[0].strip()
+            if not re.fullmatch(r"[0-9]+", uid_value) or int(uid_value) <= 0:
+                if value:
+                    logger.warning(f"忽略无效 UP 主配置 {value!r}，UID 必须为正整数")
+                continue
+
+            mid = str(int(uid_value))
+            if mid in seen_mids:
+                continue
+            seen_mids.add(mid)
+            up_mids.append(mid)
+        return up_mids
+
+    def _configured_max_pages(self) -> int:
+        try:
+            return max(1, int(self.config.get("max_pages", 3)))
+        except (TypeError, ValueError):
+            return 3
+
     def _should_include_video(self, title: str) -> bool:
         """判断视频标题是否包含关键词（空关键词自动忽略）"""
         if not title:
             return False
 
         title_lower = title.lower()
-        for keyword in self.config.get("search_keywords", []):
+        for keyword in self._configured_keywords():
             keyword_lower = str(keyword).strip().lower()
             if not keyword_lower:
                 continue
@@ -377,26 +479,62 @@ class BilibiliPolluterPlugin(Star):
         logger.info(f"关键词 '{keyword}' 搜索完成: 找到 {len(videos)} 个符合时长的视频")
         return videos
 
-    async def _select_random_video(self) -> Optional[Dict[str, Any]]:
-        """随机选一个关键词，随机找一个符合时长要求的视频"""
-        keywords = self.config.get("search_keywords", [])
-        if not keywords:
-            logger.error("没有搜索关键词")
-            return None
+    async def _search_videos_by_up(
+        self, mid: str, max_pages: int = 3
+    ) -> List[Dict[str, Any]]:
+        """获取指定 UP 主近期投稿，按 BVID 和最大时长筛选。"""
+        if not self.client:
+            logger.error("HTTP会话未初始化")
+            return []
 
+        videos: List[Dict[str, Any]] = []
+        seen_bvids = set()
         max_duration = self.config.get("max_duration", 600)
-        max_attempts = 10  # 最大尝试次数，避免死循环
+        logger.info(f"获取 UP 主 UID {mid} 的投稿，最多读取 {max_pages} 页")
+
+        for page in range(1, max_pages + 1):
+            items = await self.client.search_user_videos(mid, page)
+            if not items:
+                break
+
+            for video in items:
+                title = video.get("title", "")
+                bvid = str(video.get("bvid", "")).strip()
+                if not bvid or bvid in seen_bvids:
+                    continue
+                seen_bvids.add(bvid)
+
+                if self._has_sent_video(video):
+                    logger.debug(f"UP 主视频已搬运过，按 BVID 跳过: {bvid} {title}")
+                    continue
+
+                duration_seconds = video.get("duration_seconds", 0)
+                if duration_seconds > max_duration:
+                    logger.debug(
+                        f"UP 主视频时长 {duration_seconds}秒 超过限制 "
+                        f"{max_duration}秒，跳过: {title}"
+                    )
+                    continue
+
+                video["play_count"] = parse_play_count(video.get("play", 0))
+                videos.append(video)
+
+            if page < max_pages:
+                await asyncio.sleep(random.uniform(0.5, 1))
+
+        logger.info(f"UP 主 UID {mid} 投稿筛选完成: 找到 {len(videos)} 个可搬运视频")
+        return videos
+
+    async def _select_random_keyword_video(
+        self, keywords: List[str]
+    ) -> Optional[Dict[str, Any]]:
+        max_duration = self.config.get("max_duration", 600)
+        max_attempts = 10
 
         for attempt in range(max_attempts):
             keyword = random.choice(keywords)
-            logger.info(f"第{attempt+1}次尝试，选中关键词: {keyword}")
-
-            max_pages_config = self.config.get("max_pages", 3)
-            try:
-                pages = random.randint(1, max(1, int(max_pages_config)))
-            except (TypeError, ValueError):
-                pages = 3
-
+            logger.info(f"第{attempt + 1}次尝试，选中关键词: {keyword}")
+            pages = random.randint(1, self._configured_max_pages())
             videos = await self._search_videos_by_keyword(keyword, pages)
 
             if not videos:
@@ -404,7 +542,9 @@ class BilibiliPolluterPlugin(Star):
                 continue
 
             unsent_videos = [
-                v for v in videos if not self._has_sent_title(v.get("title", ""))
+                video
+                for video in videos
+                if not self._has_sent_title(video.get("title", ""))
             ]
             if not unsent_videos:
                 logger.info(f"关键词 '{keyword}' 搜索结果均为已处理标题，重新选择")
@@ -416,13 +556,65 @@ class BilibiliPolluterPlugin(Star):
                 f"随机选中视频: {selected['title']} "
                 f"(时长: {selected.get('duration', '')}, {duration}秒)"
             )
-
             if duration <= max_duration:
                 return selected
-            logger.info(f"视频时长 {duration}秒 超过限制，重新选择")
 
-        logger.error(f"尝试 {max_attempts} 次后仍未找到合适的视频")
+        logger.error(f"尝试 {max_attempts} 次后仍未找到合适的关键词视频")
         return None
+
+    async def _select_random_up_video(
+        self, up_mids: List[str]
+    ) -> Optional[Dict[str, Any]]:
+        # 每次扫描先随机选择一个 UP 主；若其近期投稿都处理过，再按随机顺序尝试其他 UP 主。
+        randomized_ups = list(up_mids)
+        random.shuffle(randomized_ups)
+        max_pages = self._configured_max_pages()
+
+        for mid in randomized_ups:
+            logger.info(f"本轮选中 UP 主 UID: {mid}")
+            videos = await self._search_videos_by_up(mid, max_pages)
+            if not videos:
+                continue
+
+            selected = random.choice(videos)
+            logger.info(
+                f"随机选中 UP 主视频: {selected['title']} "
+                f"(UP UID: {mid}, BV: {selected['bvid']}, "
+                f"时长: {selected.get('duration', '')})"
+            )
+            return selected
+
+        logger.warning("配置的 UP 主中没有找到可搬运的近期视频")
+        return None
+
+    async def _select_random_video(self) -> Optional[Dict[str, Any]]:
+        """根据筛选模式从关键词搜索或指定 UP 主投稿中随机选择视频。"""
+        mode = self._selection_mode()
+        keywords = self._configured_keywords()
+        up_mids = self._configured_up_mids()
+
+        if mode == "keyword":
+            if not keywords:
+                logger.error("筛选方式为关键词，但没有配置搜索关键词")
+                return None
+            return await self._select_random_keyword_video(keywords)
+
+        if mode == "up_uid":
+            if not up_mids:
+                logger.error("筛选方式为 UP 主 UID，但没有配置有效的 UP 主 UID")
+                return None
+            return await self._select_random_up_video(up_mids)
+
+        # 必须两侧都有配置才能维持用户要求的严格 50/50 来源概率。
+        if not keywords or not up_mids:
+            logger.error("两者随机模式需要同时配置搜索关键词和有效的 UP 主 UID")
+            return None
+
+        source = random.choice(("keyword", "up_uid"))
+        logger.info(f"两者随机模式本轮来源: {'关键词' if source == 'keyword' else 'UP 主 UID'}")
+        if source == "keyword":
+            return await self._select_random_keyword_video(keywords)
+        return await self._select_random_up_video(up_mids)
 
     # ==================== 发送部分 ====================
 
@@ -610,7 +802,9 @@ class BilibiliPolluterPlugin(Star):
                 if video_info:
                     # 下载失败：记录标题，避免下次反复尝试同一视频
                     await self._record_sent_title(
-                        video_info.get("title", ""), failed=True
+                        video_info.get("title", ""),
+                        failed=True,
+                        bvid=video_info.get("bvid", ""),
                     )
                 if event:
                     await event.send(
@@ -626,11 +820,15 @@ class BilibiliPolluterPlugin(Star):
                 )
                 self._last_scan_failed = not send_ok
                 if send_ok:
-                    await self._record_sent_title(video_info.get("title", ""))
+                    await self._record_sent_title(
+                        video_info.get("title", ""), bvid=video_info.get("bvid", "")
+                    )
                 else:
                     # 发送失败：记录 failed 标题，同样清理本地文件
                     await self._record_sent_title(
-                        video_info.get("title", ""), failed=True
+                        video_info.get("title", ""),
+                        failed=True,
+                        bvid=video_info.get("bvid", ""),
                     )
                     await event.send(
                         MessageChain(
@@ -649,7 +847,9 @@ class BilibiliPolluterPlugin(Star):
                 all_failed = send_success_count == 0
                 self._last_scan_failed = all_failed
                 await self._record_sent_title(
-                    video_info.get("title", ""), failed=all_failed
+                    video_info.get("title", ""),
+                    failed=all_failed,
+                    bvid=video_info.get("bvid", ""),
                 )
                 if all_failed:
                     logger.warning(
@@ -786,6 +986,14 @@ class BilibiliPolluterPlugin(Star):
         max_duration = self.config.get("max_duration", 600)
         use_whitelist_mode = self.policy.is_whitelist_mode()
         cooldown_remaining = self._get_manual_now_cooldown_remaining()
+        selection_mode = self._selection_mode()
+        selection_mode_name = {
+            "keyword": "关键词",
+            "up_uid": "UP主UID",
+            "random": "两者随机",
+        }[selection_mode]
+        keywords = self._configured_keywords()
+        up_mids = self._configured_up_mids()
         failed_count = sum(
             1 for item in self.sent_titles.values() if item.get("failed") is True
         )
@@ -797,15 +1005,25 @@ class BilibiliPolluterPlugin(Star):
             f"最大时长: {max_duration}秒 ({max_duration // 60}分钟)",
             f"已记录标题: {len(self.sent_titles)} 个"
             + (f"（其中失败 {failed_count} 个）" if failed_count else ""),
+            f"已记录视频BVID: {len(self.sent_video_ids)} 个",
             f"/bilibanshi now 冷却: {'⏳ 剩余 ' + str(cooldown_remaining) + ' 秒' if cooldown_remaining > 0 else '✅ 无'}",
             f"群推送模式: {self.policy.mode_name()}",
             f"已绑定的群: {len(self.bound_groups)} 个",
             f"白名单群: {len(self.policy.group_list('whitelist_groups'))} 个",
             f"黑名单群: {len(self.policy.group_list('blacklist_groups'))} 个",
-            f"关键词: {len(self.config.get('search_keywords', []))} 个",
+            f"视频来源筛选: {selection_mode_name}",
+            f"关键词: {len(keywords)} 个",
+            f"指定UP主UID: {len(up_mids)} 个",
             f"数据目录: {self.data_dir}",
             f"FFmpeg: {'✅ 可用' if self.ffmpeg_available else '❌ 不可用'}",
         ]
+
+        if selection_mode == "random" and (not keywords or not up_mids):
+            status.append("提示: 两者随机模式需要同时配置关键词和有效的UP主UID")
+        elif selection_mode == "keyword" and not keywords:
+            status.append("提示: 当前为关键词模式，但未配置搜索关键词")
+        elif selection_mode == "up_uid" and not up_mids:
+            status.append("提示: 当前为UP主UID模式，但未配置有效的UP主UID")
 
         whitelist_groups = sorted(self.policy.group_list("whitelist_groups"))
         blacklist_groups = sorted(self.policy.group_list("blacklist_groups"))

@@ -21,7 +21,7 @@
         "description": "搜索页数",
         "type": "int",
         "default": 5,
-        "hint": "搜索B站时最多翻几页，页数越多可选视频越多，但速度越慢"
+        "hint": "关键词模式下最多搜索几页；UP主UID模式下每个投稿列表最多读取几页。页数越多可选视频越多，但请求也越多"
     },
     "video_quality": {
         "description": "视频画质",
@@ -53,6 +53,19 @@
             "高松灯"
         ],
         "hint": "B站搜索使用的关键词，每次随机选一个关键词搜索视频"
+    },
+    "selection_mode": {
+        "description": "视频来源筛选方式",
+        "type": "string",
+        "options": ["关键词", "UP主UID", "两者随机"],
+        "default": "关键词",
+        "hint": "关键词：从搜索关键词中搬运；UP主UID：从指定UP主投稿中搬运；两者随机：每轮先以相同概率选择关键词或UP主来源，再从该来源配置中随机选择"
+    },
+    "up_mids": {
+        "description": "UP主UID列表",
+        "type": "list",
+        "default": [],
+        "hint": "每项填写 UID 或 UID:备注，例如 123456 或 123456:喜欢的UP。备注只用于配置时识别，不参与请求；两者随机模式需同时配置关键词和UID"
     },
     "blacklist_groups": {
         "description": "黑名单群号列表",
