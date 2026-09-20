@@ -23,6 +23,13 @@
         "default": 5,
         "hint": "关键词模式下最多搜索几页；UP主UID模式下每个投稿列表最多读取几页。页数越多可选视频越多，但请求也越多"
     },
+    "bilibili_cookie": {
+        "description": "B站 Cookie（可选）",
+        "type": "string",
+        "default": "",
+        "secret": true,
+        "hint": "可粘贴浏览器请求中的 Cookie 内容，支持带或不带 Cookie: 前缀。Cookie 是登录凭证，请勿分享；配置为空时继续使用匿名请求"
+    },
     "video_quality": {
         "description": "视频画质",
         "type": "int",

@@ -7,8 +7,11 @@ import hashlib
 import logging
 import re
 import time
+from http.cookies import SimpleCookie
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlencode
+
+from yarl import URL
 
 logger = logging.getLogger(__name__)
 
@@ -108,10 +111,46 @@ class BilibiliClient:
         self._wbi_keys: Optional[Tuple[str, str]] = None
         self._wbi_keys_fetched_at: float = 0.0
         self._wbi_lock = asyncio.Lock()
+        self.last_user_video_error: Optional[Dict[str, Any]] = None
+        self._risk_blocked_until: float = 0.0
+
+    RISK_CONTROL_COOLDOWN_SECONDS = 600
 
     # ------------------------------------------------------------------
     # cookies / wbi 密钥
     # ------------------------------------------------------------------
+
+    def apply_custom_cookies(self, cookie_header: Any) -> int:
+        """将配置的 Cookie 请求头写入 B 站 API 会话，不记录 Cookie 内容。"""
+        if not isinstance(cookie_header, str) or not cookie_header.strip():
+            return 0
+
+        cookie_header = cookie_header.strip()
+        if cookie_header[:7].lower() == "cookie:":
+            cookie_header = cookie_header[7:].strip()
+
+        parsed = SimpleCookie()
+        try:
+            parsed.load(cookie_header)
+        except Exception:
+            logger.warning("自定义B站Cookie无法解析，请检查配置格式")
+            return 0
+
+        cookies = {name: morsel.value for name, morsel in parsed.items()}
+        if not cookies:
+            logger.warning("自定义B站Cookie中没有可用字段，请检查配置格式")
+            return 0
+
+        try:
+            self.session.cookie_jar.update_cookies(
+                cookies, response_url=URL("https://api.bilibili.com/")
+            )
+        except Exception:
+            logger.warning("写入自定义B站Cookie失败，请检查配置")
+            return 0
+
+        logger.info("已加载用户配置的B站Cookie（%d项）", len(cookies))
+        return len(cookies)
 
     async def init_cookies(self) -> None:
         """初始化 buvid3/buvid4 等 cookies，降低 412 风控概率。"""
@@ -269,7 +308,15 @@ class BilibiliClient:
     ) -> List[Dict[str, Any]]:
         """获取指定 UP 主按投稿时间排序的一页视频。"""
         result = await self.diagnose_user_video_page(mid, page, page_size)
-        return result["items"] if result["ok"] else []
+        if result["ok"]:
+            self.last_user_video_error = None
+            return result["items"]
+
+        self.last_user_video_error = {
+            key: result.get(key)
+            for key in ("stage", "http_status", "api_code", "message")
+        }
+        return []
 
     async def diagnose_user_video_page(
         self, mid: str, page: int = 1, page_size: int = 30
@@ -288,8 +335,21 @@ class BilibiliClient:
             "dropped_count": 0,
             "missing_title_count": 0,
             "missing_bvid_count": 0,
+            "risk_cooldown_seconds": 0,
             "items": [],
         }
+
+        risk_cooldown = self._risk_blocked_until - time.monotonic()
+        if risk_cooldown > 0:
+            remaining = int(risk_cooldown + 0.999)
+            result.update(
+                stage="risk_cooldown",
+                api_code=-352,
+                message=f"风控冷却中，约 {remaining} 秒后才会重试",
+                risk_cooldown_seconds=remaining,
+            )
+            return result
+        self._risk_blocked_until = 0.0
 
         keys = await self._get_wbi_keys()
         if not keys:
@@ -331,6 +391,13 @@ class BilibiliClient:
                     f"获取 UP 主 {mid} 投稿失败: "
                     f"code={api_code}, message={api_message}"
                 )
+                if api_code == -352:
+                    self._risk_blocked_until = (
+                        time.monotonic() + self.RISK_CONTROL_COOLDOWN_SECONDS
+                    )
+                    result["risk_cooldown_seconds"] = (
+                        self.RISK_CONTROL_COOLDOWN_SECONDS
+                    )
                 result.update(
                     stage="api",
                     api_code=api_code,

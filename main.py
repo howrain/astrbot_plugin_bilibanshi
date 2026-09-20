@@ -79,6 +79,7 @@ class BilibiliPolluterPlugin(Star):
         self.scan_lock = asyncio.Lock()
         # 上次搬石是否失败（用于定时任务失败退避，避免持续触发风控）
         self._last_scan_failed = False
+        self._last_scan_api_error: Optional[Dict[str, Any]] = None
 
         # 并发控制信号量（最大5个并发请求）
         self.semaphore = asyncio.Semaphore(5)
@@ -166,6 +167,8 @@ class BilibiliPolluterPlugin(Star):
 
         # 初始化B站cookies（防止412错误）
         await self.client.init_cookies()
+        # 自定义 Cookie 在自动获取 buvid 后写入，让用户配置优先生效。
+        self.client.apply_custom_cookies(self.config.get("bilibili_cookie", ""))
 
         # 开机自启动
         if self.config.get("auto_start", True):
@@ -495,6 +498,15 @@ class BilibiliPolluterPlugin(Star):
         for page in range(1, max_pages + 1):
             items = await self.client.search_user_videos(mid, page)
             if not items:
+                api_error = getattr(self.client, "last_user_video_error", None)
+                if api_error:
+                    self._last_scan_api_error = dict(api_error)
+                    logger.warning(
+                        f"UP 主 UID {mid} 投稿接口失败，停止本轮查询: "
+                        f"stage={api_error.get('stage')}, "
+                        f"code={api_error.get('api_code')}, "
+                        f"message={api_error.get('message')}"
+                    )
                 break
 
             for video in items:
@@ -573,6 +585,8 @@ class BilibiliPolluterPlugin(Star):
         for mid in randomized_ups:
             logger.info(f"本轮选中 UP 主 UID: {mid}")
             videos = await self._search_videos_by_up(mid, max_pages)
+            if self._last_scan_api_error:
+                break
             if not videos:
                 continue
 
@@ -583,6 +597,10 @@ class BilibiliPolluterPlugin(Star):
                 f"时长: {selected.get('duration', '')})"
             )
             return selected
+
+        if self._last_scan_api_error:
+            logger.warning("UP 主投稿查询失败，本轮不再按‘没有可搬运视频’处理")
+            return None
 
         logger.warning("配置的 UP 主中没有找到可搬运的近期视频")
         return None
@@ -781,6 +799,7 @@ class BilibiliPolluterPlugin(Star):
         # 互斥锁：同一时间只允许一个搬石流程（定时任务 / 手动触发）
         async with self.scan_lock:
             logger.info("开始随机搬石...")
+            self._last_scan_api_error = None
 
             if event:
                 block_message = self._get_manual_block_message(event)
@@ -798,7 +817,9 @@ class BilibiliPolluterPlugin(Star):
             success, file_path, cover_path, video_info = await self._execute_scan_and_download()
 
             if not success:
-                self._last_scan_failed = video_info is not None
+                self._last_scan_failed = (
+                    video_info is not None or self._last_scan_api_error is not None
+                )
                 if video_info:
                     # 下载失败：记录标题，避免下次反复尝试同一视频
                     await self._record_sent_title(
@@ -807,8 +828,25 @@ class BilibiliPolluterPlugin(Star):
                         bvid=video_info.get("bvid", ""),
                     )
                 if event:
+                    if self._last_scan_api_error:
+                        api_error = self._last_scan_api_error
+                        if api_error.get("api_code") == -352:
+                            message = (
+                                "❌ B站投稿接口触发风控(-352)，查询已进入10分钟冷却；"
+                                "本次扫描已停止继续请求"
+                            )
+                        else:
+                            message = (
+                                "❌ B站投稿接口请求失败，自动扫描将按失败策略退避后重试"
+                            )
+                    else:
+                        message = "❌ 没有找到合适的视频或下载失败"
                     await event.send(
-                        MessageChain([Plain("❌ 没有找到合适的视频或下载失败")])
+                        MessageChain([Plain(message)])
+                    )
+                elif self._last_scan_api_error:
+                    logger.warning(
+                        "投稿 API 失败触发定时任务退避，等待至少10分钟后再试"
                     )
                 return
 
@@ -908,8 +946,7 @@ class BilibiliPolluterPlugin(Star):
                 # 执行扫描和下载
                 await self._scan_and_download()
 
-                # 等待下一次扫描；发送/下载失败后退避更长时间，
-                # 避免持续高频富媒体上传触发 QQ 限流
+                # 请求、下载或发送失败后统一退避，避免持续请求加重风控或平台限流。
                 if self._last_scan_failed:
                     await asyncio.sleep(max(self.config.get("scan_interval", 60), 600))
                 else:

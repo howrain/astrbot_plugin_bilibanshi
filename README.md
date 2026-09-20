@@ -33,6 +33,7 @@
 - `scan_interval`：扫描间隔（秒）
 - `max_duration`：最大视频时长（秒）
 - `max_pages`：搜索页数
+- `bilibili_cookie`：可选的 B 站 Cookie 请求头，支持粘贴 Cookie 值或带 `Cookie:` 前缀的完整请求头；WebUI 中会遮罩显示
 - `video_quality`：视频画质（16/32/64/80，默认 64=720P）
 - `transcode`：强制转码为 H.264 main profile（默认关闭，兼容性最好但更耗 CPU）
 - `delete_after_send`：发送后删除本地视频
@@ -52,6 +53,8 @@
 - `两者随机`：每轮先以 50% 概率选择关键词来源或 UP 主来源，然后再从该来源配置的关键词或 UID 列表中随机选择。此模式需要两边都至少配置一项。
 
 UP 主模式仍受 `max_duration` 和 `max_pages` 限制；已处理视频按 BVID 去重。`max_pages` 表示每次读取投稿列表的最大页数。
+投稿接口返回风控码 `-352` 时，插件会停止本轮查询并冷却 10 分钟；冷却期间不会再次请求该投稿接口。
+配置 `bilibili_cookie` 后，Cookie 会用于 B 站 API 请求；留空时继续匿名请求。Cookie 属于登录凭证，AstrBot 只在 WebUI 中遮罩显示，配置文件中仍以原值保存，请勿分享配置文件或公开 Cookie。添加 Cookie 也不能保证解除 B 站针对 IP 或请求行为的风控。
 为避免清理旧记录后重复搬运，BVID 历史不设数量上限，会随着已处理视频数量增长并保存在 `runtime_state.json` 中。
 
 ### 群推送模式说明
