@@ -28,12 +28,13 @@ except ImportError:
     from state_store import StateStore
 
 
-@register("astrbot_plugin_bilibanshi", "Xuewu", "B站搬石 - 随机搬视频到群", "1.2.1")
+@register("astrbot_plugin_bilibanshi", "Xuewu", "B站搬石 - 随机搬视频到群", "1.2.3")
 class BilibiliPolluterPlugin(Star):
     # /bilibanshi now 防刷屏参数
     MANUAL_NOW_WINDOW_SECONDS = 60
     MANUAL_NOW_COOLDOWN_SECONDS = 60
     SCHEDULE_FAILURE_COOLDOWN_SECONDS = 600
+    SCHEDULE_JOB_NAME = "astrbot_plugin_bilibanshi.schedule"
     # 标题记录有上限；BVID 历史完整保留，确保 UP 投稿不会因裁剪而重播
     MAX_SENT_TITLES = 5000
 
@@ -75,7 +76,9 @@ class BilibiliPolluterPlugin(Star):
 
         # 运行状态
         self.running = False
-        self.task: Optional[asyncio.Task] = None
+        self._scheduled_run_task: Optional[asyncio.Task] = None
+        self._schedule_cancel_requested = False
+        self._schedule_retry_not_before = 0.0
         # 搬石互斥锁：防止定时任务与手动 now 并发下载/写状态
         self.scan_lock = asyncio.Lock()
         # 上次搬石是否失败（用于定时任务失败退避，避免持续触发风控）
@@ -149,7 +152,7 @@ class BilibiliPolluterPlugin(Star):
     # ==================== 生命周期 ====================
 
     async def initialize(self):
-        """插件初始化 - 创建会话、迁移旧配置、启动定时任务"""
+        """插件初始化 - 创建会话、迁移旧配置、注册定时任务"""
         self._ensure_schedule_defaults()
         timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=20)
         self.session = aiohttp.ClientSession(headers=self.headers, timeout=timeout)
@@ -175,21 +178,16 @@ class BilibiliPolluterPlugin(Star):
         # 开机自启动
         if self.config.get("auto_start", True):
             self.running = True
-            self.task = asyncio.create_task(self._timer_task())
-            logger.info("B站搬石已开机自启动")
+            try:
+                await self._register_scheduled_job()
+                logger.info("B站搬石已开机自启动")
+            except Exception as e:
+                self.running = False
+                logger.error(f"注册定时任务失败，搬石未启动: {e}")
 
     async def terminate(self):
         """插件卸载时清理"""
-        self.running = False
-        if self.task:
-            self.task.cancel()
-            try:
-                await self.task
-            except asyncio.CancelledError:
-                logger.info("定时任务已取消")
-            except Exception as e:
-                logger.error(f"定时任务停止时出错: {e}")
-            self.task = None
+        await self._stop_scheduled_job()
 
         # 清理临时文件（下载中的协程被 cancel 后已自行清理半成品）
         if self.downloader:
@@ -802,6 +800,7 @@ class BilibiliPolluterPlugin(Star):
         async with self.scan_lock:
             logger.info("开始随机搬石...")
             self._last_scan_api_error = None
+            self._last_scan_failed = False
 
             if event:
                 block_message = self._get_manual_block_message(event)
@@ -903,7 +902,6 @@ class BilibiliPolluterPlugin(Star):
 
             # 清理文件
             await self._cleanup_after_send(file_path, cover_path)
-            self._last_scan_failed = False
 
     # ==================== 定时任务 ====================
 
@@ -984,28 +982,6 @@ class BilibiliPolluterPlugin(Star):
         parsed[4] = {0 if day == 7 else day for day in parsed[4]}
         return parsed, fields
 
-    @classmethod
-    def _cron_matches(cls, expression: str, when: datetime) -> bool:
-        """判断本地时间是否匹配五段式 Cron。"""
-        values, fields = cls._parse_cron_expression(expression)
-        minute, hour, day_of_month, month, day_of_week = values
-
-        if when.minute not in minute or when.hour not in hour or when.month not in month:
-            return False
-
-        dom_matches = when.day in day_of_month
-        cron_weekday = (when.weekday() + 1) % 7
-        dow_matches = cron_weekday in day_of_week
-        dom_is_wildcard = fields[2] == "*"
-        dow_is_wildcard = fields[4] == "*"
-        if dom_is_wildcard and dow_is_wildcard:
-            return True
-        if dom_is_wildcard:
-            return dow_matches
-        if dow_is_wildcard:
-            return dom_matches
-        return dom_matches or dow_matches
-
     @staticmethod
     def _normalize_hhmm(value: Any) -> str:
         """规范化 HH:MM 时间，兼容 "9:00" 等非零填充格式。"""
@@ -1038,56 +1014,107 @@ class BilibiliPolluterPlugin(Star):
         # 跨午夜范围，如 23:00 - 08:00
         return now >= quiet_start or now < quiet_end
 
-    async def _timer_task(self):
-        """按本地时间的 Cron 分钟触发定时任务。"""
-        last_checked_minute = None
-        last_invalid_expression = None
-        retry_not_before = 0.0
-        loop = asyncio.get_running_loop()
+    def _get_cron_manager(self):
+        """获取 AstrBot 的统一 Cron 管理器。"""
+        manager = getattr(self.context, "cron_manager", None)
+        if not manager or not all(
+            callable(getattr(manager, method, None))
+            for method in ("add_basic_job", "list_jobs", "delete_job")
+        ):
+            raise RuntimeError(
+                "当前 AstrBot 未提供 cron_manager 插件调度 API，请升级 AstrBot"
+            )
+        return manager
 
-        while self.running:
+    async def _delete_scheduled_jobs(self, manager) -> None:
+        """清理本插件此前注册的同名任务，防止热重载留下重复调度。"""
+        for job in await manager.list_jobs():
+            if (
+                getattr(job, "job_type", None) == "basic"
+                and getattr(job, "name", None) == self.SCHEDULE_JOB_NAME
+            ):
+                await manager.delete_job(job.job_id)
+
+    async def _register_scheduled_job(self, expression: Optional[str] = None) -> None:
+        """通过 AstrBot Core 的 CronJobManager 注册唯一的定时推送任务。"""
+        expression = str(
+            expression or self.config.get("cron_expression", "0 * * * *")
+        ).strip()
+        self._parse_cron_expression(expression)
+
+        manager = self._get_cron_manager()
+        await self._cancel_scheduled_run()
+        await self._delete_scheduled_jobs(manager)
+        await manager.add_basic_job(
+            name=self.SCHEDULE_JOB_NAME,
+            description="按插件 Cron 配置搬运并推送 B 站视频",
+            cron_expression=expression,
+            handler=self._run_scheduled_scan,
+            persistent=False,
+        )
+
+    async def _cancel_scheduled_run(self) -> None:
+        task = self._scheduled_run_task
+        if task and task is not asyncio.current_task() and not task.done():
+            self._schedule_cancel_requested = True
+            task.cancel()
             try:
-                now = datetime.now()
-                scheduled_minute = now.replace(second=0, microsecond=0)
-                if scheduled_minute != last_checked_minute:
-                    last_checked_minute = scheduled_minute
-                    expression = str(
-                        self.config.get("cron_expression", "0 * * * *")
-                    ).strip()
-                    try:
-                        due = self._cron_matches(expression, scheduled_minute)
-                    except ValueError as e:
-                        due = False
-                        if expression != last_invalid_expression:
-                            logger.error(f"定时任务 Cron 表达式无效，已暂停触发: {e}")
-                        last_invalid_expression = expression
-                    else:
-                        last_invalid_expression = None
-
-                    if due and self._is_quiet_hours():
-                        logger.debug("当前在免打扰时段，跳过本次定时推送")
-                    elif due and loop.time() < retry_not_before:
-                        logger.debug("定时任务仍在失败冷却期，跳过本次触发")
-                    elif due:
-                        await self._scan_and_download()
-                        if self._last_scan_failed:
-                            retry_not_before = (
-                                loop.time() + self.SCHEDULE_FAILURE_COOLDOWN_SECONDS
-                            )
-                        else:
-                            retry_not_before = 0.0
-
-                # Cron 精度为分钟；对齐到下一分钟边界，避免固定间隔逐渐漂移。
-                now = datetime.now()
-                seconds_to_next_minute = 60 - now.second - now.microsecond / 1_000_000
-                await asyncio.sleep(max(0.1, seconds_to_next_minute))
-
+                await task
             except asyncio.CancelledError:
-                logger.info("定时任务被取消")
-                break
+                logger.info("定时扫描已取消")
             except Exception as e:
-                logger.error(f"定时任务异常: {e}")
-                await asyncio.sleep(1)
+                logger.error(f"定时扫描停止时出错: {e}")
+            finally:
+                self._schedule_cancel_requested = False
+
+    async def _stop_scheduled_job(self) -> None:
+        """移除未来触发，并停止正在执行的本插件定时扫描。"""
+        self.running = False
+        manager = getattr(self.context, "cron_manager", None)
+        if manager and all(
+            callable(getattr(manager, method, None))
+            for method in ("list_jobs", "delete_job")
+        ):
+            try:
+                await self._delete_scheduled_jobs(manager)
+            except Exception as e:
+                logger.error(f"移除 AstrBot 定时任务失败: {e}")
+        await self._cancel_scheduled_run()
+
+    async def _run_scheduled_scan(self) -> None:
+        """CronJobManager 回调：检查宵禁和失败冷却后执行一次扫描。"""
+        if not self.running:
+            return
+
+        if self._is_quiet_hours():
+            logger.debug("当前在免打扰时段，跳过本次定时推送")
+            return
+
+        loop = asyncio.get_running_loop()
+        if loop.time() < self._schedule_retry_not_before:
+            logger.debug("定时任务仍在失败冷却期，跳过本次触发")
+            return
+
+        current_task = asyncio.current_task()
+        self._scheduled_run_task = current_task
+        try:
+            await self._scan_and_download()
+        except asyncio.CancelledError:
+            if self.running and not self._schedule_cancel_requested:
+                raise
+            logger.info("插件调度变更期间取消定时扫描")
+        except Exception as e:
+            self._last_scan_failed = True
+            logger.error(f"定时扫描异常: {e}")
+        finally:
+            if self.running and self._last_scan_failed:
+                self._schedule_retry_not_before = (
+                    loop.time() + self.SCHEDULE_FAILURE_COOLDOWN_SECONDS
+                )
+            else:
+                self._schedule_retry_not_before = 0.0
+            if self._scheduled_run_task is current_task:
+                self._scheduled_run_task = None
 
     # ==================== 指令区 ====================
 
@@ -1100,7 +1127,13 @@ class BilibiliPolluterPlugin(Star):
             return
 
         self.running = True
-        self.task = asyncio.create_task(self._timer_task())
+        try:
+            await self._register_scheduled_job()
+        except Exception as e:
+            self.running = False
+            logger.error(f"开启定时搬石失败: {e}")
+            yield event.plain_result(f"开启失败，无法注册定时任务: {e}")
+            return
         yield event.plain_result("B站搬石已开启")
 
     @filter.command("bilibanshi off")
@@ -1108,19 +1141,11 @@ class BilibiliPolluterPlugin(Star):
     async def turn_off(self, event: AstrMessageEvent):
         """关闭搬石"""
         if not self.running:
+            await self._stop_scheduled_job()
             yield event.plain_result("搬石已经关闭了")
             return
 
-        self.running = False
-        if self.task:
-            self.task.cancel()
-            try:
-                await self.task
-            except asyncio.CancelledError:
-                logger.info("定时任务已取消")
-            except Exception as e:
-                logger.error(f"停止定时任务时出错: {e}")
-            self.task = None
+        await self._stop_scheduled_job()
         yield event.plain_result("B站搬石已关闭")
 
     @filter.command("bilibanshi now")
@@ -1435,6 +1460,22 @@ class BilibiliPolluterPlugin(Star):
         except ValueError as e:
             yield event.plain_result(f"Cron表达式无效: {e}")
             return
+
+        previous_expression = str(
+            self.config.get("cron_expression", "0 * * * *")
+        ).strip()
+        if self.running:
+            try:
+                await self._register_scheduled_job(expression)
+            except Exception as e:
+                logger.error(f"更新定时 Cron 失败: {e}")
+                try:
+                    await self._register_scheduled_job(previous_expression)
+                except Exception as restore_error:
+                    self.running = False
+                    logger.error(f"恢复原定时任务失败，已停止自动搬石: {restore_error}")
+                yield event.plain_result(f"更新定时 Cron 失败，保留原配置: {e}")
+                return
 
         self.config["cron_expression"] = expression
         self.config.save_config()

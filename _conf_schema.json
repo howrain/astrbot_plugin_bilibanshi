@@ -9,7 +9,7 @@
         "description": "定时任务 Cron 表达式",
         "type": "string",
         "default": "0 * * * *",
-        "hint": "使用五段式 Cron（分 时 日 月 周），按 AstrBot 主机本地时区执行；默认每小时整点执行一次，例如 0 */2 * * * 表示每两小时执行一次"
+        "hint": "使用五段式 Cron（分 时 日 月 周），由 AstrBot Core 调度器按有效时区执行；默认每小时整点执行一次，例如 0 */2 * * * 表示每两小时执行一次。修改后重载插件生效"
     },
     "max_duration": {
         "description": "最大视频时长（秒）",
