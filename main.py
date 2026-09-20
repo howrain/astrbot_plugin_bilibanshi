@@ -7,6 +7,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import aiohttp
+from apscheduler.jobstores.base import JobLookupError
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
@@ -28,7 +31,7 @@ except ImportError:
     from state_store import StateStore
 
 
-@register("astrbot_plugin_bilibanshi", "Xuewu", "B站搬石 - 随机搬视频到群", "1.2.3")
+@register("astrbot_plugin_bilibanshi", "Xuewu", "B站搬石 - 随机搬视频到群", "1.2.4")
 class BilibiliPolluterPlugin(Star):
     # /bilibanshi now 防刷屏参数
     MANUAL_NOW_WINDOW_SECONDS = 60
@@ -79,6 +82,7 @@ class BilibiliPolluterPlugin(Star):
         self._scheduled_run_task: Optional[asyncio.Task] = None
         self._schedule_cancel_requested = False
         self._schedule_retry_not_before = 0.0
+        self.scheduler = AsyncIOScheduler()
         # 搬石互斥锁：防止定时任务与手动 now 并发下载/写状态
         self.scan_lock = asyncio.Lock()
         # 上次搬石是否失败（用于定时任务失败退避，避免持续触发风控）
@@ -154,6 +158,7 @@ class BilibiliPolluterPlugin(Star):
     async def initialize(self):
         """插件初始化 - 创建会话、迁移旧配置、注册定时任务"""
         self._ensure_schedule_defaults()
+        await self._cleanup_legacy_core_jobs()
         timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=20)
         self.session = aiohttp.ClientSession(headers=self.headers, timeout=timeout)
         self.client = BilibiliClient(self.session, self.semaphore)
@@ -188,6 +193,9 @@ class BilibiliPolluterPlugin(Star):
     async def terminate(self):
         """插件卸载时清理"""
         await self._stop_scheduled_job()
+        await self._cleanup_legacy_core_jobs()
+        if self.scheduler.running:
+            self.scheduler.shutdown(wait=False)
 
         # 清理临时文件（下载中的协程被 cancel 后已自行清理半成品）
         if self.downloader:
@@ -1014,44 +1022,60 @@ class BilibiliPolluterPlugin(Star):
         # 跨午夜范围，如 23:00 - 08:00
         return now >= quiet_start or now < quiet_end
 
-    def _get_cron_manager(self):
-        """获取 AstrBot 的统一 Cron 管理器。"""
+    @classmethod
+    def _build_cron_trigger(cls, expression: str) -> CronTrigger:
+        """解析标准五段 Cron，并将星期转换为 APScheduler 的周日起始名称。"""
+        values, fields = cls._parse_cron_expression(expression)
+        weekday_names = ("sun", "mon", "tue", "wed", "thu", "fri", "sat")
+        weekdays = values[4]
+        weekday_field = (
+            "*"
+            if len(weekdays) == 7
+            else ",".join(weekday_names[day] for day in sorted(weekdays))
+        )
+        apscheduler_expression = " ".join((*fields[:4], weekday_field))
+        return CronTrigger.from_crontab(
+            apscheduler_expression,
+            timezone=None,
+        )
+
+    async def _cleanup_legacy_core_jobs(self) -> None:
+        """清理此前版本注册在 AstrBot Core 中的遗留任务。"""
         manager = getattr(self.context, "cron_manager", None)
         if not manager or not all(
             callable(getattr(manager, method, None))
-            for method in ("add_basic_job", "list_jobs", "delete_job")
+            for method in ("list_jobs", "delete_job")
         ):
-            raise RuntimeError(
-                "当前 AstrBot 未提供 cron_manager 插件调度 API，请升级 AstrBot"
-            )
-        return manager
-
-    async def _delete_scheduled_jobs(self, manager) -> None:
-        """清理本插件此前注册的同名任务，防止热重载留下重复调度。"""
-        for job in await manager.list_jobs():
-            if (
-                getattr(job, "job_type", None) == "basic"
-                and getattr(job, "name", None) == self.SCHEDULE_JOB_NAME
-            ):
-                await manager.delete_job(job.job_id)
+            return
+        try:
+            for job in await manager.list_jobs():
+                if (
+                    getattr(job, "job_type", None) == "basic"
+                    and getattr(job, "name", None) == self.SCHEDULE_JOB_NAME
+                ):
+                    await manager.delete_job(job.job_id)
+        except Exception as e:
+            logger.warning(f"清理旧版 Core 定时任务失败: {e}")
 
     async def _register_scheduled_job(self, expression: Optional[str] = None) -> None:
-        """通过 AstrBot Core 的 CronJobManager 注册唯一的定时推送任务。"""
+        """通过插件独立的 APScheduler 注册唯一的定时推送任务。"""
         expression = str(
             expression or self.config.get("cron_expression", "0 * * * *")
         ).strip()
-        self._parse_cron_expression(expression)
-
-        manager = self._get_cron_manager()
+        trigger = self._build_cron_trigger(expression)
         await self._cancel_scheduled_run()
-        await self._delete_scheduled_jobs(manager)
-        await manager.add_basic_job(
-            name=self.SCHEDULE_JOB_NAME,
-            description="按插件 Cron 配置搬运并推送 B 站视频",
-            cron_expression=expression,
-            handler=self._run_scheduled_scan,
-            persistent=False,
+        self.scheduler.add_job(
+            self._run_scheduled_scan,
+            trigger=trigger,
+            id=self.SCHEDULE_JOB_NAME,
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=30,
         )
+        if not self.scheduler.running:
+            self.scheduler.start()
+        logger.info(f"B站搬石定时任务已注册: {expression}")
 
     async def _cancel_scheduled_run(self) -> None:
         task = self._scheduled_run_task
@@ -1068,17 +1092,12 @@ class BilibiliPolluterPlugin(Star):
                 self._schedule_cancel_requested = False
 
     async def _stop_scheduled_job(self) -> None:
-        """移除未来触发，并停止正在执行的本插件定时扫描。"""
+        """移除本地调度任务，并停止正在执行的定时扫描。"""
         self.running = False
-        manager = getattr(self.context, "cron_manager", None)
-        if manager and all(
-            callable(getattr(manager, method, None))
-            for method in ("list_jobs", "delete_job")
-        ):
-            try:
-                await self._delete_scheduled_jobs(manager)
-            except Exception as e:
-                logger.error(f"移除 AstrBot 定时任务失败: {e}")
+        try:
+            self.scheduler.remove_job(self.SCHEDULE_JOB_NAME)
+        except JobLookupError:
+            pass
         await self._cancel_scheduled_run()
 
     async def _run_scheduled_scan(self) -> None:
