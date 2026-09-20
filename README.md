@@ -84,6 +84,7 @@ UP 主模式仍受 `max_duration` 和 `max_pages` 限制；已处理视频按 BV
 - `/bilibanshi off`：关闭定时搬石
 - `/bilibanshi now`：立即执行一次，发送到当前聊天
 - `/bilibanshi list`：查看当前状态
+- `/bilibanshi diagnoseup <UID>`：只读诊断 UP 主投稿接口、解析和本地筛选结果；不会下载、发送或记录视频
 
 说明：
 

@@ -979,6 +979,121 @@ class BilibiliPolluterPlugin(Star):
         await event.send(MessageChain([Plain("开始搬石...")]))
         await self._scan_and_download(event)
 
+    @filter.command("bilibanshi diagnoseup")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def diagnose_up(self, event: AstrMessageEvent):
+        """只读诊断 UP 主投稿查询及本地筛选，不下载、发送或写入状态。"""
+        parts = event.message_str.strip().split()
+        if len(parts) < 3 or not re.fullmatch(r"[0-9]+", parts[2]):
+            yield event.plain_result("用法: /bilibanshi diagnoseup <UP主UID>")
+            return
+
+        mid = str(int(parts[2]))
+        if int(mid) <= 0:
+            yield event.plain_result("UP主UID必须是正整数")
+            return
+        if not self.client:
+            yield event.plain_result("HTTP会话未初始化，无法诊断")
+            return
+
+        max_pages = self._configured_max_pages()
+        try:
+            max_duration = max(0, int(self.config.get("max_duration", 600)))
+        except (TypeError, ValueError):
+            max_duration = 600
+
+        pages_checked = 0
+        raw_count = 0
+        normalized_count = 0
+        dropped_count = 0
+        missing_title_count = 0
+        missing_bvid_count = 0
+        duplicate_count = 0
+        sent_count = 0
+        too_long_count = 0
+        eligible_count = 0
+        total_count = None
+        seen_bvids = set()
+        last_result: Dict[str, Any] = {}
+        stop_reason = "已扫描完配置页数"
+
+        for page in range(1, max_pages + 1):
+            result = await self.client.diagnose_user_video_page(mid, page)
+            pages_checked += 1
+            last_result = result
+            if not result.get("ok"):
+                stop_reason = "投稿接口请求失败"
+                break
+
+            raw_count += int(result.get("raw_count", 0))
+            normalized_count += int(result.get("normalized_count", 0))
+            dropped_count += int(result.get("dropped_count", 0))
+            missing_title_count += int(result.get("missing_title_count", 0))
+            missing_bvid_count += int(result.get("missing_bvid_count", 0))
+            if result.get("total_count") is not None:
+                total_count = result["total_count"]
+
+            items = result.get("items", [])
+            for video in items:
+                bvid = str(video.get("bvid", "")).strip()
+                if not bvid or bvid in seen_bvids:
+                    duplicate_count += 1
+                    continue
+                seen_bvids.add(bvid)
+
+                if self._has_sent_video(video):
+                    sent_count += 1
+                    continue
+
+                if video.get("duration_seconds", 0) > max_duration:
+                    too_long_count += 1
+                    continue
+
+                eligible_count += 1
+
+            if not items:
+                if result.get("raw_count", 0) == 0:
+                    if result.get("vlist_present"):
+                        stop_reason = f"第 {page} 页接口返回的 vlist 为空"
+                    else:
+                        stop_reason = f"第 {page} 页响应缺少 data.list.vlist"
+                else:
+                    stop_reason = f"第 {page} 页原始条目未能解析出有效标题和 BVID"
+                break
+
+            if page < max_pages:
+                await asyncio.sleep(random.uniform(0.5, 1))
+
+        if last_result and not last_result.get("ok"):
+            details = [
+                f"UID: {mid}",
+                f"失败页: {pages_checked}",
+                f"失败阶段: {last_result.get('stage', 'unknown')}",
+                f"HTTP: {last_result.get('http_status') or '无响应码'}",
+                f"B站 code: {last_result.get('api_code')}",
+                f"原因: {last_result.get('message') or '未提供'}",
+                "本轮结论: 投稿接口未成功返回，正常搬运流程会把它当作空结果。",
+            ]
+            yield event.plain_result("\n".join(details))
+            return
+
+        conclusion = (
+            "存在符合当前筛选条件的投稿。"
+            if eligible_count
+            else stop_reason
+            if normalized_count == 0
+            else "扫描到的投稿均被重复记录或最大时长筛选。"
+        )
+        details = [
+            f"=== UP 主投稿诊断: {mid} ===",
+            f"扫描页数: {pages_checked}/{max_pages}；B站报告总投稿数: {total_count if total_count is not None else '未提供'}",
+            f"原始 vlist: {raw_count}；解析有效: {normalized_count}；解析丢弃: {dropped_count}（缺标题 {missing_title_count}，缺 BVID {missing_bvid_count}）",
+            f"本地筛选: 重复 BVID {duplicate_count}，已处理 {sent_count}，超过 {max_duration} 秒 {too_long_count}，可搬运 {eligible_count}",
+            f"停止原因: {stop_reason}",
+            f"结论: {conclusion}",
+        ]
+        yield event.plain_result("\n".join(details))
+
     @filter.command("bilibanshi list")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def list_status(self, event: AstrMessageEvent):

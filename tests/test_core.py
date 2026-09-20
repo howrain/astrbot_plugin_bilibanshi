@@ -36,6 +36,29 @@ class MockConfig(dict):
         self.save_called += 1
 
 
+class _MockApiResponse:
+    def __init__(self, payload, status=200):
+        self.payload = payload
+        self.status = status
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+    async def json(self):
+        return self.payload
+
+
+class _MockApiSession:
+    def __init__(self, payload, status=200):
+        self.response = _MockApiResponse(payload, status)
+
+    def get(self, url):
+        return self.response
+
+
 class TestWbiSign(unittest.TestCase):
     def test_mixin_key_table_valid(self):
         """打乱表必须是 64 个不重复索引（0-63）。"""
@@ -94,6 +117,68 @@ class TestParse(unittest.TestCase):
         self.assertEqual(clean_filename(""), "untitled")
         self.assertEqual(clean_filename("x" * 200), "x" * 100)
         self.assertEqual(clean_filename("   "), "untitled")
+
+
+class TestUserVideoDiagnostics(unittest.TestCase):
+    def _client(self, payload):
+        client = BilibiliClient(_MockApiSession(payload))
+
+        async def get_wbi_keys():
+            return ("a" * 32, "b" * 32)
+
+        client._get_wbi_keys = get_wbi_keys
+        return client
+
+    def test_reports_raw_and_normalized_user_video_counts(self):
+        client = self._client(
+            {
+                "code": 0,
+                "message": "0",
+                "data": {
+                    "page": {"count": 2},
+                    "list": {
+                        "vlist": [
+                            {
+                                "title": "可解析视频",
+                                "bvid": "BV1xx411c7mD",
+                                "length": "3:00",
+                            },
+                            {"title": "缺少 BVID", "length": "2:00"},
+                        ]
+                    },
+                },
+            }
+        )
+
+        result = asyncio.run(client.diagnose_user_video_page("402709951"))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["total_count"], 2)
+        self.assertEqual(result["raw_count"], 2)
+        self.assertEqual(result["normalized_count"], 1)
+        self.assertEqual(result["dropped_count"], 1)
+        self.assertEqual(result["missing_bvid_count"], 1)
+        self.assertEqual(result["items"][0]["bvid"], "BV1xx411c7mD")
+
+    def test_distinguishes_successful_empty_vlist(self):
+        client = self._client(
+            {
+                "code": 0,
+                "message": "0",
+                "data": {
+                    "page": {"count": 12},
+                    "list": {"vlist": []},
+                },
+            }
+        )
+
+        result = asyncio.run(client.diagnose_user_video_page("402709951"))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["total_count"], 12)
+        self.assertTrue(result["vlist_present"])
+        self.assertEqual(result["raw_count"], 0)
+        self.assertEqual(result["items"], [])
 
 
 class TestGroupNormalize(unittest.TestCase):

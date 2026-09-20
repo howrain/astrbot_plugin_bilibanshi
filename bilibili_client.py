@@ -268,10 +268,34 @@ class BilibiliClient:
         self, mid: str, page: int = 1, page_size: int = 30
     ) -> List[Dict[str, Any]]:
         """获取指定 UP 主按投稿时间排序的一页视频。"""
+        result = await self.diagnose_user_video_page(mid, page, page_size)
+        return result["items"] if result["ok"] else []
+
+    async def diagnose_user_video_page(
+        self, mid: str, page: int = 1, page_size: int = 30
+    ) -> Dict[str, Any]:
+        """请求一页投稿并返回只读诊断信息，不记录或修改任何状态。"""
+        result: Dict[str, Any] = {
+            "ok": False,
+            "stage": "",
+            "http_status": None,
+            "api_code": None,
+            "message": "",
+            "total_count": None,
+            "vlist_present": False,
+            "raw_count": 0,
+            "normalized_count": 0,
+            "dropped_count": 0,
+            "missing_title_count": 0,
+            "missing_bvid_count": 0,
+            "items": [],
+        }
+
         keys = await self._get_wbi_keys()
         if not keys:
             logger.warning(f"获取 UP 主 {mid} 投稿失败：WBI 密钥不可用")
-            return []
+            result.update(stage="wbi_keys", message="WBI 密钥不可用")
+            return result
 
         try:
             params = enc_wbi(
@@ -288,30 +312,73 @@ class BilibiliClient:
             api_url = "https://api.bilibili.com/x/space/wbi/arc/search?" + urlencode(params)
             async with self.semaphore:
                 async with self.session.get(api_url) as response:
+                    result["http_status"] = response.status
                     if response.status != 200:
                         logger.warning(
                             f"获取 UP 主 {mid} 投稿失败: HTTP {response.status}"
                         )
-                        return []
+                        result.update(
+                            stage="http",
+                            message=f"HTTP {response.status}",
+                        )
+                        return result
                     data = await response.json()
 
             if data.get("code") != 0:
+                api_code = data.get("code")
+                api_message = str(data.get("message", "未知错误"))[:160]
                 logger.warning(
                     f"获取 UP 主 {mid} 投稿失败: "
-                    f"code={data.get('code')}, message={data.get('message', '未知错误')}"
+                    f"code={api_code}, message={api_message}"
                 )
-                return []
+                result.update(
+                    stage="api",
+                    api_code=api_code,
+                    message=api_message,
+                )
+                return result
 
-            vlist = (
-                (data.get("data") or {}).get("list") or {}
-            ).get("vlist") or []
-            return self._normalize_user_video_items(vlist, mid)
+            payload = data.get("data") or {}
+            video_list = payload.get("list") or {}
+            raw_vlist = video_list.get("vlist")
+            vlist = raw_vlist if isinstance(raw_vlist, list) else []
+            page_info = payload.get("page") or video_list.get("page") or {}
+            items = self._normalize_user_video_items(vlist, mid)
+
+            result.update(
+                ok=True,
+                stage="complete",
+                api_code=data.get("code"),
+                message=str(data.get("message", ""))[:160],
+                total_count=page_info.get("count") if isinstance(page_info, dict) else None,
+                vlist_present=isinstance(raw_vlist, list),
+                raw_count=len(vlist),
+                normalized_count=len(items),
+                dropped_count=max(0, len(vlist) - len(items)),
+                missing_title_count=sum(
+                    1
+                    for video in vlist
+                    if not isinstance(video, dict)
+                    or not clean_html_title(video.get("title", ""))
+                ),
+                missing_bvid_count=sum(
+                    1
+                    for video in vlist
+                    if not isinstance(video, dict)
+                    or not str(video.get("bvid", "")).strip()
+                ),
+                items=items,
+            )
+            return result
         except asyncio.TimeoutError:
             logger.warning(f"获取 UP 主 {mid} 投稿第{page}页超时")
-            return []
+            result.update(stage="timeout", message="请求超时")
+            return result
         except Exception as e:
             logger.error(f"获取 UP 主 {mid} 投稿第{page}页出错: {e}")
-            return []
+            # 不把异常文本回传到诊断命令，避免泄露带签名的请求 URL。
+            result.update(stage="exception", message=type(e).__name__)
+            return result
 
     @staticmethod
     def _normalize_user_video_items(
